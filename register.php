@@ -1,41 +1,32 @@
 <?php
+require __DIR__ . '/config_mysqli.php';
+require __DIR__ . '/csrf.php';
 
-//include config ตรงนี้นะจ๊ะ 
-
-// เปิด session เพื่อใช้ CSRF token และ flash message
-session_start();
-
-// สร้าง CSRF token ครั้งแรก
-if (empty($_SESSION['csrf_token'])) {
-  $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+/* =========================
+   Register (minimal-change)
+   ========================= */
 
 $errors = [];
 $success = "";
+// คงตัวแปรเดิมไว้เพื่อแสดงค่าเดิมในฟอร์ม
+$username = $email = $full_name = "";
 
-// เชื่อมต่อฐานข้อมูล (MySQLi)
-$mysqli = @new mysqli($db_host, $db_user, $db_pass, $db_name);
-if ($mysqli->connect_errno) {
-  die("เชื่อมต่อฐานข้อมูลล้มเหลว: " . $mysqli->connect_error);
-}
-$mysqli->set_charset("utf8mb4");
-
-// ฟังก์ชันเล็ก ๆ กัน XSS เวลา echo ค่าเดิมกลับฟอร์ม
+// ฟังก์ชันกัน XSS เวลา echo กลับ
 function e($str){ return htmlspecialchars($str ?? "", ENT_QUOTES, "UTF-8"); }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-  // ตรวจ CSRF token
-  if (empty($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+  // --- CSRF ให้ตรงระบบ (ใช้ name="csrf" + csrf_check()) ---
+  if (empty($_POST['csrf']) || !csrf_check($_POST['csrf'])) {
     $errors[] = "CSRF token ไม่ถูกต้อง กรุณารีเฟรชหน้าแล้วลองอีกครั้ง";
   }
 
-  // รับค่าจากฟอร์ม
+  // รับค่าจากฟอร์ม (คงชื่อฟิลด์เดิมไว้)
   $username  = trim($_POST['username'] ?? "");
   $password  = $_POST['password'] ?? "";
   $email     = trim($_POST['email'] ?? "");
   $full_name = trim($_POST['name'] ?? "");
 
-  // ตรวจความถูกต้องเบื้องต้น
+  // ตรวจความถูกต้องเดิม ๆ (คง regex username ไว้ถึงแม้จะไม่บันทึกลง DB)
   if ($username === "" || !preg_match('/^[A-Za-z0-9_\.]{3,30}$/', $username)) {
     $errors[] = "กรุณากรอก username 3–30 ตัวอักษร (a-z, A-Z, 0-9, _, .)";
   }
@@ -45,51 +36,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
     $errors[] = "อีเมลไม่ถูกต้อง";
   }
-  if ($full_name === "" || mb_strlen($full_name) > 100) {
-    $errors[] = "กรุณากรอกชื่อ–นามสกุล (ไม่เกิน 100 ตัวอักษร)";
+  if ($full_name === "" || mb_strlen($full_name) > 190) {
+    $errors[] = "กรุณากรอกชื่อ–นามสกุล (ไม่เกิน 190 ตัวอักษร)";
   }
 
-  // ตรวจซ้ำ username/email
+  // --- ตรวจซ้ำด้วยอีเมลอย่างเดียว (ตารางจริงไม่มี username) ---
   if (!$errors) {
-    $sql = "SELECT 1 FROM users WHERE username = ? OR email = ? LIMIT 1";
-    if ($stmt = $mysqli->prepare($sql)) {
-      $stmt->bind_param("ss", $username, $email);
-      $stmt->execute();
-      $stmt->store_result();
-      if ($stmt->num_rows > 0) {
-        $errors[] = "Username หรือ Email นี้ถูกใช้แล้ว";
-      }
-      $stmt->close();
-    } else {
-      $errors[] = "เกิดข้อผิดพลาดในการตรวจสอบข้อมูล (prepare)";
+    $sql = "SELECT 1 FROM users WHERE email = ? LIMIT 1";
+    $stmt = $mysqli->prepare($sql);
+    $stmt->bind_param("s", $email);
+    $stmt->execute();
+    $stmt->store_result();
+    if ($stmt->num_rows > 0) {
+      $errors[] = "อีเมลนี้ถูกใช้แล้ว";
     }
+    $stmt->close();
   }
 
-  // บันทึกลงฐานข้อมูล
+  // --- INSERT ให้ตรงสคีมา: email, display_name, password_hash ---
   if (!$errors) {
     $password_hash = password_hash($password, PASSWORD_DEFAULT);
-
-    $sql = "INSERT INTO users (username, email, password_hash, full_name) VALUES (?, ?, ?, ?)";
-    if ($stmt = $mysqli->prepare($sql)) {
-      $stmt->bind_param("ssss", $username, $email, $password_hash, $full_name);
-      if ($stmt->execute()) {
-        $success = "สมัครสมาชิกสำเร็จ! คุณสามารถล็อกอินได้แล้วค่ะ";
-        // regenerate CSRF token หลังสำเร็จ
-        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-        // เคลียร์ฟอร์ม
-        $username = $email = $full_name = "";
-      } else {
-        // ตรวจจับ duplicate เฉพาะทาง
-        if ($mysqli->errno == 1062) {
-          $errors[] = "Username/Email ซ้ำ กรุณาใช้ค่าอื่น";
-        } else {
-          $errors[] = "บันทึกข้อมูลไม่สำเร็จ: " . e($mysqli->error);
-        }
-      }
-      $stmt->close();
+    $sql = "INSERT INTO users (email, display_name, password_hash) VALUES (?, ?, ?)";
+    $stmt = $mysqli->prepare($sql);
+    $stmt->bind_param("sss", $email, $full_name, $password_hash); // map $full_name -> display_name
+    if ($stmt->execute()) {
+      $success = "สมัครสมาชิกสำเร็จ! คุณสามารถล็อกอินได้แล้วค่ะ";
+      // เคลียร์ฟอร์ม
+      $username = $email = $full_name = "";
     } else {
-      $errors[] = "เกิดข้อผิดพลาดในการบันทึกข้อมูล (prepare)";
+      // duplicate email
+      if ($mysqli->errno == 1062) {
+        $errors[] = "อีเมลนี้ถูกใช้แล้ว";
+      } else {
+        $errors[] = "บันทึกข้อมูลไม่สำเร็จ: ".e($mysqli->error);
+      }
     }
+    $stmt->close();
   }
 }
 ?>
@@ -117,20 +99,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   <div class="container">
     <h1>สมัครสมาชิก</h1>
 
-    <?php if ($errors): ?>
+    <?php if (!empty($errors)): ?>
       <div class="alert error">
         <?php foreach ($errors as $m) echo "<div>".e($m)."</div>"; ?>
       </div>
     <?php endif; ?>
 
-    <?php if ($success): ?>
+    <?php if (!empty($success)): ?>
       <div class="alert success"><?= e($success) ?></div>
     <?php endif; ?>
 
     <form method="post" action="">
-      <input type="hidden" name="csrf_token" value="<?= e($_SESSION['csrf_token']) ?>">
+      <!-- ใช้ชื่อฟิลด์ csrf ให้ตรงระบบ -->
+      <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+
       <label>Username</label>
-      <input type="text" name="username" value="<?= e($username ?? "") ?>" required>
+      <input type="text" name="username" value="<?= e($username) ?>" required>
       <div class="hint">อนุญาต a-z, A-Z, 0-9, _ และ . (3–30 ตัว)</div>
 
       <label>Password</label>
@@ -138,10 +122,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       <div class="hint">อย่างน้อย 8 ตัวอักษร</div>
 
       <label>Email</label>
-      <input type="email" name="email" value="<?= e($email ?? "") ?>" required>
+      <input type="email" name="email" value="<?= e($email) ?>" required>
 
       <label>ชื่อ–นามสกุล</label>
-      <input type="text" name="name" value="<?= e($full_name ?? "") ?>" required>
+      <input type="text" name="name" value="<?= e($full_name) ?>" required>
 
       <button type="submit">สมัครสมาชิก</button>
     </form>
